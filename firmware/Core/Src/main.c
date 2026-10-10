@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "dma.h"
 #include "hrtim.h"
 #include "tim.h"
@@ -25,9 +26,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+
+#include "cmsis_os2.h"
 #include "sai.h"
-#include "pdm2pcm_glo.h"
-#include "arm_math.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,6 +39,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define PDM_BUFFER_SIZE 256
 
 /* USER CODE END PD */
 
@@ -51,168 +55,21 @@ COM_InitTypeDef BspCOMInit;
 
 /* USER CODE BEGIN PV */
 
-float32_t mfcc_test_variable = 3.14f;
-
-#define PDM_BUFFER_SIZE 256
-
-#define PCM_SAMPLES_PER_MS 16
-#define PCM_HALF_BUFFER (PCM_SAMPLES_PER_MS * 2)
-
-#define PCM_1_SEC_SIZE 16000
-
-PDM_Filter_Handler_t PDM_FilterHandler_Left;
-PDM_Filter_Handler_t PDM_FilterHandler_Right;
-PDM_Filter_Config_t PDM_FilterConfig;
-
-uint16_t pdm_rx_buffer[PDM_BUFFER_SIZE];
-
-int16_t pcm_buffer[PCM_1_SEC_SIZE];
-
-arm_biquad_casd_df1_inst_f32 hpf_instance;
-float32_t hpf_state[4]; // 4 stany pamięci dla jednego kaskadowego bloku IIR
-
-// Wyliczone współczynniki Butterworth HPF (Fs=16000, Fc=80)
-// CMSIS-DSP wymaga specyficznego formatu znaków: {b0, b1, b2, -a1, -a2}
-float32_t hpf_coeffs[5] = {0.9780f, -1.9561f, 0.9780f, 1.9556f, -0.9565f};
-
-volatile uint8_t half_buffer_ready = 0;
-volatile uint8_t full_buffer_ready = 0;
-
-volatile uint8_t recording_complete = 0;
-volatile uint32_t pcm_buffer_index = 0;
+extern osThreadId_t dspTaskHandle;
+extern uint16_t pdm_rx_buffer[PDM_BUFFER_SIZE];
+extern volatile uint8_t recording_complete;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-void Audio_Init(void) 
-{
-    // UWAGA: Biblioteka PDM_Filter zablokuje się (HardFault lub brak działania), 
-    // jeśli sprzętowy moduł CRC nie zostanie wcześniej uruchomiony!
-    __HAL_RCC_CRC_CLK_ENABLE();
-
-    // -- Konfiguracja LEWEGO mikrofonu --
-    PDM_FilterHandler_Left.bit_order        = PDM_FILTER_BIT_ORDER_MSB; // Zależy od mikrofonu
-    PDM_FilterHandler_Left.endianness       = PDM_FILTER_ENDIANNESS_LE; // Little Endian dla STM32
-    PDM_FilterHandler_Left.high_pass_tap    = 2122358088; // Współczynnik usuwania DC Offset (ok 0.99)
-    PDM_FilterHandler_Left.in_ptr_channels  = 2; // Skaczemy co 2 bajty w buforze wejściowym
-    PDM_FilterHandler_Left.out_ptr_channels = 1; // Zostawiamy dziurę na drugi kanał w buforze wyj.
-    PDM_Filter_Init(&PDM_FilterHandler_Left);
-
-    // -- Konfiguracja PRAWEGO mikrofonu --
-    PDM_FilterHandler_Right.bit_order        = PDM_FILTER_BIT_ORDER_MSB;
-    PDM_FilterHandler_Right.endianness       = PDM_FILTER_ENDIANNESS_LE;
-    PDM_FilterHandler_Right.high_pass_tap    = 2122358088;
-    PDM_FilterHandler_Right.in_ptr_channels  = 2;
-    PDM_FilterHandler_Right.out_ptr_channels = 1;
-    PDM_Filter_Init(&PDM_FilterHandler_Right);
-
-    // -- Konfiguracja wspólna (Filtru) --
-    PDM_FilterConfig.output_samples_number = PCM_SAMPLES_PER_MS; // 16 próbek dla jednego kanału!
-    PDM_FilterConfig.mic_gain              = 15;   // Wzmocnienie (kalibruj eksperymentalnie)
-    PDM_FilterConfig.decimation_factor     = PDM_FILTER_DEC_FACTOR_64;
-    
-    PDM_Filter_setConfig(&PDM_FilterHandler_Left, &PDM_FilterConfig);
-    PDM_Filter_setConfig(&PDM_FilterHandler_Right, &PDM_FilterConfig);
-
-    arm_biquad_cascade_df1_init_f32(&hpf_instance, 1, hpf_coeffs, hpf_state);
-}
-
-void Process_PDM_Data(uint16_t *pdm_data_chunk) 
-{
-    if (recording_complete) return; // Jeśli mamy sekundę, zignoruj resztę
-
-    // 1. Oszukujemy kompilator: rzutujemy paczkę 16-bit na wskaźnik 8-bitowy (bajtowy)
-    uint8_t *in_byte = (uint8_t *)pdm_data_chunk;
-    
-    // 2. Obliczamy aktualne miejsce zapisu w dużym buforze PCM
-    int16_t temp_left[PCM_SAMPLES_PER_MS];
-    int16_t temp_right[PCM_SAMPLES_PER_MS];
-    float32_t temp_f32[PCM_SAMPLES_PER_MS]; // Nasz nowy bufor roboczy FPU
-
-    // 3. Konwersja PRAWEGO kanału
-    // in_byte[0] to LSB z 16-bitowego słowa
-    // pcm_out[1] zapisuje wynik w prawej "szczelinie" stereo
-    PDM_Filter(
-        (void*)&in_byte[0], 
-        (void*)&temp_right[0], 
-        &PDM_FilterHandler_Right
-    );
-
-    // 4. Konwersja LEWEGO kanału
-    // in_byte[1] to MSB z 16-bitowego słowa
-    // pcm_out[0] zapisuje wynik w lewej "szczelinie" stereo
-    PDM_Filter(
-        (void*)&in_byte[1], 
-        (void*)&temp_left[0], 
-        &PDM_FilterHandler_Left
-    );
-
-    // 5. Konwersja do float32_t
-    // KROK A: Downmix (Mono) i konwersja do float32_t
-    for (int i = 0; i < PCM_SAMPLES_PER_MS; i++) 
-    {
-        temp_f32[i] = (float32_t)( ((int32_t)temp_left[i] + (int32_t)temp_right[i]) / 2 );
-    }
-
-    // KROK B: Przepuszczenie paczki 16 próbek przez potężny filtr IIR Biquad
-    arm_biquad_cascade_df1_f32(&hpf_instance, temp_f32, temp_f32, PCM_SAMPLES_PER_MS);
-
-    // KROK C: Powrót z floatów na 16-bitowe liczby całkowite do głównego bufora
-    for (int i = 0; i < PCM_SAMPLES_PER_MS; i++) 
-    {
-        pcm_buffer[pcm_buffer_index + i] = (int16_t)temp_f32[i];
-    }
-
-    // 5. Przesuwamy wskaźnik o 32 nowo dodane próbki (16 lewych + 16 prawych)
-    pcm_buffer_index += PCM_SAMPLES_PER_MS;
-    
-    // 6. Sprawdzamy czy nagraliśmy już całą sekundę
-    if(pcm_buffer_index >= PCM_1_SEC_SIZE) {
-        recording_complete = 1;
-        HAL_SAI_DMAStop(&hsai_BlockA1); // Zatrzymujemy DMA
-    }
-}
-
-void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) 
-{
-  half_buffer_ready = 1;
-}
-
-void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) 
-{
-  full_buffer_ready = 1;
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    // Upewniamy się, że to przerwanie pochodzi od Timera 6
-    if (htim->Instance == TIM6) 
-    {
-        // Sprawdzamy naszą flagę
-        if (recording_complete == 0) 
-        {
-            // Migaj diodą - funkcja Toggle zmienia stan na przeciwny
-            // UWAGA: Zmień LED_GPIO_Port i LED_Pin na etykiety, 
-            // które nadałeś swojej diodzie w CubeMX (np. GPIOA, GPIO_PIN_5)
-            HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
-        }
-        else 
-        {
-            // Jeśli zatrzymano nagrywanie, upewnij się, że dioda zgasła
-            // (zakładając, że RESET gasi diodę na Twojej płytce)
-            HAL_GPIO_WritePin(LED2_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);
-        }
-    }
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -254,13 +111,15 @@ int main(void)
 
   MY_SAI1_Init();  // Initialize the SAI1 peripheral with custom settings
 
-  Audio_Init();
-
   HAL_TIM_Base_Start_IT(&htim6);
 
   HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)pdm_rx_buffer, PDM_BUFFER_SIZE);
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
 
   /* Initialize led */
   BSP_LED_Init(LED_GREEN);
@@ -279,19 +138,14 @@ int main(void)
     Error_Handler();
   }
 
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    if (half_buffer_ready) {
-      half_buffer_ready = 0;
-      Process_PDM_Data(&pdm_rx_buffer[0]);
-    }
-
-    if (full_buffer_ready) {
-      full_buffer_ready = 0;
-      Process_PDM_Data(&pdm_rx_buffer[PDM_BUFFER_SIZE / 2]);
-    }
+  while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -347,7 +201,55 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+#define FLAG_HALF_CPLT 0x01
+#define FLAG_FULL_CPLT 0x02
+
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) 
+{
+  osThreadFlagsSet(dspTaskHandle, FLAG_HALF_CPLT);
+  HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
+}
+
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) 
+{
+    osThreadFlagsSet(dspTaskHandle, FLAG_FULL_CPLT);
+}
+
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM7 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  if (htim->Instance == TIM6) 
+  {
+    if (recording_complete == 0) 
+    {
+      // HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
+    }
+    else 
+      {
+        HAL_GPIO_WritePin(LED2_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);
+      }
+  }
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM7)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
