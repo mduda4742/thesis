@@ -1,0 +1,14 @@
+# Foldery budowania (CMake / Make)
+build/
+firmware/build/
+
+# Pamięć podręczna i środowisko
+.cache/
+.vscode/
+
+# Pliki tymczasowe STM32CubeMX
+*.mxproject
+
+# Pliki binarne i pliki wynikowe
+*.raw
+firmware/*.raw
