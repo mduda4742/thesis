@@ -29,6 +29,7 @@
 
 #include "cmsis_os2.h"
 #include "sai.h"
+#include "audio_dsp.h"
 
 /* USER CODE END Includes */
 
@@ -111,9 +112,9 @@ int main(void)
 
   MY_SAI1_Init();  // Initialize the SAI1 peripheral with custom settings
 
-  HAL_TIM_Base_Start_IT(&htim6);
+  Audio_DSP_Init();  // Initialize the audio DSP processing
 
-  HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)pdm_rx_buffer, PDM_BUFFER_SIZE);
+  HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
 
@@ -207,7 +208,7 @@ void SystemClock_Config(void)
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) 
 {
   osThreadFlagsSet(dspTaskHandle, FLAG_HALF_CPLT);
-  HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
+  // HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
 }
 
 void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) 
@@ -233,7 +234,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     if (recording_complete == 0) 
     {
-      // HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
+      HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
     }
     else 
       {

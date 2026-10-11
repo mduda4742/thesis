@@ -67,7 +67,7 @@ osThreadId_t dspTaskHandle;
 const osThreadAttr_t dspTask_attributes = {
   .name = "dspTask",
   .priority = (osPriority_t) osPriorityHigh,
-  .stack_size = 4096
+  .stack_size = 1024
 };
 
 /* USER CODE END Variables */
@@ -156,7 +156,7 @@ void StartDefaultTask(void *argument)
 
 void StartDspTask(void *argument)
 {
-  Audio_DSP_Init();
+  Audio_DSP_Init();  // Initialize the audio DSP processing
 
   HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)pdm_rx_buffer, PDM_BUFFER_SIZE);
 
