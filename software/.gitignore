@@ -12,3 +12,13 @@
 *.swp
 *.swo
 
+# środowisko
+.venv/
+.python-version
+
+# cache Python
+__pycache__/
+
+# wyniki treningu
+work/
+

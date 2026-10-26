@@ -28,6 +28,10 @@ import sys
 import tarfile
 
 import numpy as np
+import scipy.signal as sig
+import cmsisdsp as dsp
+import cmsisdsp.mfcc as mfcc_cfg
+from cmsisdsp.datatype import F32
 from six.moves import urllib
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
@@ -383,6 +387,77 @@ class AudioProcessor(object):
         spectrogram,
         wav_decoder.sample_rate,
         dct_coefficient_count=model_settings['dct_coefficient_count'])
+    # --- CMSIS-DSP MFCC (zgodny z arm_mfcc_f32 na MCU) ---
+    # Wystawiamy przetworzony sygnal (1 s, 16000 probek) PRZED spektrogramem.
+    # MFCC liczymy w _mfcc_cmsis(), a nie przez contrib_audio.mfcc powyzej.
+    self.background_clamp_ = background_clamp
+    self._init_cmsis_mfcc(model_settings)
+
+  def _init_cmsis_mfcc(self, model_settings):
+    """Buduje jednorazowo konfiguracje MFCC identyczna jak arm_mfcc_f32 na MCU."""
+    sr = model_settings.get('sample_rate', 16000)
+    self._frame_len = model_settings['window_size_samples']    # 640 (40 ms)
+    self._stride = model_settings['window_stride_samples']     # 320 (20 ms)
+    self._n_frames = model_settings['spectrogram_length']      # 49
+    self._n_dct = model_settings['dct_coefficient_count']      # 10
+    n_mel = 40                                                 # NUM_FBANK_BINS
+    # FFT = najblizsza potega 2 >= frame_len (640 -> 1024), z zero-paddingiem
+    self._fft_len = 1 << int(np.ceil(np.log2(self._frame_len)))
+
+    # okno Hanna nad frame_len probek, reszta do FFT = 0 (jak w mfcc.cpp)
+    self._window = np.zeros(self._fft_len, dtype=np.float32)
+    self._window[:self._frame_len] = sig.windows.hann(
+        self._frame_len, sym=False).astype(np.float32)
+
+    # mel-filterbank 20-4000 Hz + macierz DCT-II; TE SAME tablice wkleja sie do
+    # arm_mfcc_init_f32 w kodzie C na G474RE -> zgodnosc cech co do bitu
+    filt_len, filt_pos, mel_coef = mfcc_cfg.melFilterMatrix(
+        F32, 20.0, 4000.0, n_mel, sr, self._fft_len)
+    dct_coef = mfcc_cfg.dctMatrix(F32, self._n_dct, n_mel)
+
+    self._mfcc_inst = dsp.arm_mfcc_instance_f32()
+    status = dsp.arm_mfcc_init_f32(
+        self._mfcc_inst, self._fft_len, n_mel, self._n_dct,
+        dct_coef, filt_pos, filt_len, mel_coef, self._window)
+    if status != 0:
+      raise RuntimeError('arm_mfcc_init_f32 zwrocilo status %d' % status)
+
+    # Szum mikrofonu dodawany do KAZDEJ probki (jak na MCU). Plik wskazujesz
+    # zmienna srodowiskowa KWS_MIC_NOISE=<nagranie ciszy>. Brak -> bez szumu.
+    self._mic_noise = None
+    noise_path = os.environ.get('KWS_MIC_NOISE')
+    if noise_path:
+      import wave
+      wn = wave.open(noise_path, 'rb')
+      n = np.frombuffer(wn.readframes(wn.getnframes()),
+                        dtype=np.int16).astype(np.float32) / 32768.0
+      wn.close()
+      n = n[int(0.15 * sr):]   # odetnij startowy transient (~0.15 s)
+      n = n - n.mean()         # usun DC
+      if n.size < 64:
+        raise RuntimeError('Nagranie szumu za krotkie po obcieciu transientu')
+      self._mic_noise = n
+
+  def _mfcc_cmsis(self, waveform):
+    """Liczy MFCC (n_frames x n_dct) dla 1 s sygnalu przez CMSIS-DSP."""
+    waveform = np.asarray(waveform, dtype=np.float32).flatten()
+    feats = np.empty((self._n_frames, self._n_dct), dtype=np.float32)
+    tmp = np.zeros(self._fft_len, dtype=np.float32)   # bufor roboczy
+    for f in range(self._n_frames):
+      start = f * self._stride
+      frame = np.zeros(self._fft_len, dtype=np.float32)
+      chunk = waveform[start:start + self._frame_len]
+      frame[:len(chunk)] = chunk
+      # arm_mfcc_f32 nadpisuje wejscie w miejscu -> podajemy swiezy bufor
+      feats[f, :] = dsp.arm_mfcc_f32(self._mfcc_inst, frame, tmp)
+    return feats.flatten()
+
+  def _noise_slice(self, n_samples):
+    """Losowy wycinek nagranego szumu mikrofonu (zawijany), dlugosci n_samples."""
+    noise = self._mic_noise
+    start = np.random.randint(0, noise.size)
+    idx = (start + np.arange(n_samples)) % noise.size   # zawijanie (szum ~stacjonarny)
+    return noise[idx]
 
   def set_size(self, mode):
     """Calculates the number of samples in the dataset partition.
@@ -480,8 +555,13 @@ class AudioProcessor(object):
         input_dict[self.foreground_volume_placeholder_] = 0
       else:
         input_dict[self.foreground_volume_placeholder_] = 1
-      # Run the graph to produce the output audio.
-      data[i - offset, :] = sess.run(self.mfcc_, feed_dict=input_dict).flatten()
+      # Run the graph to get the processed waveform, then compute MFCC via CMSIS-DSP.
+      waveform = sess.run(self.background_clamp_, feed_dict=input_dict)
+      # Dodaj szum mikrofonu (jego naturalny poziom) do kazdej probki, jak na MCU.
+      if self._mic_noise is not None:
+        noise = self._noise_slice(waveform.shape[0]).reshape(waveform.shape)
+        waveform = np.clip(waveform + noise, -1.0, 1.0)
+      data[i - offset, :] = self._mfcc_cmsis(waveform)
       label_index = self.word_to_index[sample['label']]
       labels[i - offset, label_index] = 1
     return data, labels
