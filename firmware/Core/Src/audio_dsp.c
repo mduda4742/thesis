@@ -24,7 +24,7 @@ void Audio_DSP_Init(void)
     PDM_Filter_Init(&PDM_FilterHandler_Right);
 
     PDM_FilterConfig.output_samples_number = PCM_SAMPLES_PER_MS;
-    PDM_FilterConfig.mic_gain              = 15;
+    PDM_FilterConfig.mic_gain              = 13;
     PDM_FilterConfig.decimation_factor     = PDM_FILTER_DEC_FACTOR_64;
     
     PDM_Filter_setConfig(&PDM_FilterHandler_Left, &PDM_FilterConfig);

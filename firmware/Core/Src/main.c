@@ -58,7 +58,6 @@ COM_InitTypeDef BspCOMInit;
 
 extern osThreadId_t dspTaskHandle;
 extern uint16_t pdm_rx_buffer[PDM_BUFFER_SIZE];
-extern volatile uint8_t recording_complete;
 
 /* USER CODE END PV */
 
@@ -230,16 +229,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
 
-  if (htim->Instance == TIM6) 
+  if (htim->Instance == TIM6)
   {
-    if (recording_complete == 0) 
-    {
-      HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
-    }
-    else 
-      {
-        HAL_GPIO_WritePin(LED2_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);
-      }
+    // streaming nagrywa ciagle - LED2 miga jako wskaznik "slucham/zyje"
+    HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
   }
 
   /* USER CODE END Callback 0 */

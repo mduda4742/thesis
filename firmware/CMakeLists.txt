@@ -13,9 +13,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 
-# Define the build type
+# Build type: domyslnie RelWithDebInfo = -O2 -g -DNDEBUG (zoptymalizowany ORAZ debugowalny).
+# Release (-O3, bez -g) lub Debug (-O0) wymusisz przez -DCMAKE_BUILD_TYPE=...
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Debug")
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
 endif()
 
 # Set the project name
@@ -41,6 +42,12 @@ add_subdirectory(cmake/stm32cubemx)
 set(CMSISCORE ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/CMSIS)
 set(DISABLEFLOAT16 TRUE)
 add_subdirectory(third_party/CMSIS-DSP)
+
+# CMSIS-DSP kompiluje sie bez -fdata-sections, wiec WSZYSTKIE tablice FFT (f32/f64/q31/q15,
+# kazda dlugosc) lezą w jednej sekcji .rodata (~578 KB) i linker --gc-sections nie moze ich
+# usunac -> przepelnienie Flash. Wymuszamy osobne sekcje + optymalizacje rozmiaru, zeby
+# zostaly tylko tablice faktycznie uzywane (f32 dla FFT 1024/512).
+target_compile_options(CMSISDSP PRIVATE -fdata-sections -ffunction-sections)
 
 # PDM2PCM library integration
 add_library(PDM2PCM STATIC IMPORTED)
