@@ -13,10 +13,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 
-# Build type: domyslnie RelWithDebInfo = -O2 -g -DNDEBUG (zoptymalizowany ORAZ debugowalny).
-# Release (-O3, bez -g) lub Debug (-O0) wymusisz przez -DCMAKE_BUILD_TYPE=...
+# Default build type: Release (override with -DCMAKE_BUILD_TYPE=Debug)
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
 # Set the project name
@@ -32,6 +31,18 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
+# Release: max speed (-O3) + debug info (-g: names/types for the debugger, no effect on code or Flash).
+set(CMAKE_C_FLAGS_RELEASE "-O3 -g -DNDEBUG")
+
+# For ALL targets (own code, HAL, FreeRTOS, CMSIS). Must be before add_executable/add_subdirectory.
+#  -ffunction-sections -fdata-sections: one section per function/variable -> --gc-sections drops unused ones
+#  -fstack-usage: writes a .su file per source with the stack usage of each function
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:C>:-ffunction-sections>
+    $<$<COMPILE_LANGUAGE:C>:-fdata-sections>
+    $<$<COMPILE_LANGUAGE:C>:-fstack-usage>
+)
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
@@ -43,14 +54,8 @@ set(CMSISCORE ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/CMSIS)
 set(DISABLEFLOAT16 TRUE)
 add_subdirectory(third_party/CMSIS-DSP)
 
-# CMSIS-DSP kompiluje sie bez -fdata-sections, wiec WSZYSTKIE tablice FFT (f32/f64/q31/q15,
-# kazda dlugosc) lezą w jednej sekcji .rodata (~578 KB) i linker --gc-sections nie moze ich
-# usunac -> przepelnienie Flash. Wymuszamy osobne sekcje + optymalizacje rozmiaru, zeby
-# zostaly tylko tablice faktycznie uzywane (f32 dla FFT 1024/512).
 target_compile_options(CMSISDSP PRIVATE -fdata-sections -ffunction-sections)
 
-# ARM CMSIS-NN - TYLKO funkcje q7 uzywane przez ds_cnn + customowy arm_avepool (z local_NN).
-# Reszta biblioteki (s8/softmax/svd/...) pominieta. arm_fill_q15/arm_copy_q7/arm_fill_q7 sa w CMSIS-DSP.
 set(CMSISNN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/CMSIS-NN/Source)
 add_library(CMSISNN STATIC
     ${CMSISNN_DIR}/ConvolutionFunctions/arm_convolve_HWC_q7_basic_nonsquare.c
@@ -67,7 +72,7 @@ add_library(CMSISNN STATIC
 target_include_directories(CMSISNN PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/CMSIS-NN/Include)
 target_link_libraries(CMSISNN PUBLIC CMSISDSP::CMSISDSP)
-# -include cmsis_nn_compat.h: __SXTB16_RORn (sxtb16 z ROR), ktorego starszy rdzen ST nie opakowal.
+# -include cmsis_nn_compat.h: __SXTB16_RORn (sxtb16 z ROR)
 target_compile_options(CMSISNN PRIVATE -fdata-sections -ffunction-sections
     -include ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc/cmsis_nn_compat.h)
 
@@ -76,6 +81,17 @@ add_library(PDM2PCM STATIC IMPORTED)
 set_target_properties(PDM2PCM PROPERTIES 
     IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PDM2PCM/Lib/libPDMFilter_CM4_GCC_wc32.a"
     INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PDM2PCM/Inc"
+)
+
+# Micro-ROS static library integration
+set(MICROROS_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/micro_ros_stm32cubemx_utils/microros_static_library/libmicroros)
+if(NOT EXISTS ${MICROROS_LIB_DIR}/libmicroros.a)
+    message(FATAL_ERROR "Brak libmicroros.a - zbuduj ja dockerem (instrukcja w Makefile)")
+endif()
+add_library(microros STATIC IMPORTED)
+set_target_properties(microros PROPERTIES
+    IMPORTED_LOCATION "${MICROROS_LIB_DIR}/libmicroros.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${MICROROS_LIB_DIR}/microros_include"
 )
 
 # Link directories setup
@@ -88,13 +104,19 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/audio_dsp.c
     Core/Src/ds_cnn.c
+    microros/custom_memory_manager.c   
+    microros/microros_allocators.c     
+    microros/microros_time.c           
+    microros/dma_transport.c        
+    microros/uros_app.c             
+    microros/robot_control.c        
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
-    # Naglowki CMSIS-NN (deklaracje arm_*) dla ds_cnn.c. Biblioteke linkujemy ponizej (CMSISNN).
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/CMSIS-NN/Include
+    ${CMAKE_CURRENT_SOURCE_DIR}/microros
 )
 
 # Add project symbols (macros)
@@ -107,6 +129,8 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
     -T${CMAKE_CURRENT_SOURCE_DIR}/STM32G474xx_FLASH.ld
     -Wl,--no-warn-rwx-segments
+    -Wl,-Map=${CMAKE_PROJECT_NAME}.map   # memory map: address and size of every symbol
+    -Wl,--print-memory-usage             # Flash/RAM usage in % after each link
 )
 
 # Add linked libraries
@@ -116,5 +140,6 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     PDM2PCM
     CMSISDSP::CMSISDSP
     CMSISNN
+    microros
     m
 )

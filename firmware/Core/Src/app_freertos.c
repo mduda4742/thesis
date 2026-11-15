@@ -19,8 +19,6 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
-#include "arm_math_types.h"
-#include "system_stm32g4xx.h"
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
@@ -32,12 +30,15 @@
 #include "audio_dsp.h"
 #include <stdint.h>
 #include <string.h>
-
 #include "mfcc_tables.h"
-#include "mfcc_selftest.h"
+
 #include "ds_cnn.h"
 #include "perf.h"
 #include <math.h>
+
+#include "usart.h"
+#include "uros_app.h"
+#include "kws_event.h"
 
 /* USER CODE END Includes */
 
@@ -73,6 +74,9 @@
 #define WINDOW_STRIDE_MS 20
 #define WINDOW_STRIDE (WINDOW_STRIDE_MS * PCM_SAMPLES_PER_MS)
 
+#define KWS_CONF_THRESHOLD  0.9f    // minimal probability to accept a command (0..1)
+#define KWS_REFRACTORY_MS   1000U   // silent of the same world after recognition [ms]
+
 uint16_t pdm_rx_buffer[PDM_BUFFER_SIZE];
 int16_t window[WINDOW_SIZE];
 
@@ -82,6 +86,8 @@ volatile uint32_t window_idx = 0;
 volatile uint8_t recording_active = 0;
 
 extern SAI_HandleTypeDef hsai_BlockA1;
+
+osMessageQueueId_t kwsEventQueueHandle;
 
 osThreadId_t dspTaskHandle;
 const osThreadAttr_t dspTask_attributes = {
@@ -97,33 +103,20 @@ const osThreadAttr_t nnTask_attributes = {
   .stack_size = 2048
 };
 
-/* USER CODE END Variables */
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .priority = (osPriority_t) osPriorityNormal,
-  .stack_size = 128 * 4
+osThreadId_t urosTaskHandle;
+const osThreadAttr_t urosTask_attributes = {
+  .name = "urosTask",
+  .priority = (osPriority_t) osPriorityBelowNormal,
+  .stack_size = 3000 * 4
 };
-
-#if MFCC_FFT_LEN != 1024
-#error "Uzywamy arm_mfcc_init_1024_f32 - przy innym FFT_LEN zmien init na wlasciwa dlugosc."
-#endif
-
-static arm_mfcc_instance_f32 mfcc_inst;
-static float32_t mfcc_in [MFCC_FFT_LEN];        // pSrc (nadpisywany)
-static float32_t mfcc_tmp[2 * MFCC_FFT_LEN];    // pTmp  - UWAGA: 2*FFT (cmplx_mag czyta 2*fftLen)
 
 static float32_t mfcc_ring[MFCC_N_FRAMES][MFCC_N_DCT];
 static volatile uint8_t frame_write = 0;
 static volatile uint8_t frame_count = 0;
 
-// --- podglad wyniku sieci w debuggerze (volatile, by -O2 nie usunelo) ---
-volatile q7_t  nn_out_dbg[OUT_DIM];      // surowe logity int8
-volatile float nn_prob_dbg[OUT_DIM];     // prawdopodobienstwa 0..1 (×100 = %)
-volatile int   nn_best_dbg;              // indeks zwyciezcy (0=sil,1=unk,2=go,3=backward,4=left,5=right,6=stop)
-volatile float nn_best_prob_dbg;         // pewnosc zwyciezcy
-volatile char  nn_word_dbg[12];          // nazwa rozpoznanej klasy (np. "stop")
+// Debugging variables
+volatile float nn_prob_dbg[OUT_DIM];     // per-class probability 0..1 (order as in kws_event.h)
+volatile int   nn_best_dbg;              // index of the most probable class
 
 // Kanaly pomiaru czasu (perf.h). Srednia = sum/count, czas[us] = cykle/160.
 perf_ch_t perf_pdm     = { "pdm2pcm" };   // PDM->PCM (ProcessFrame)
@@ -134,6 +127,15 @@ perf_ch_t perf_bridge  = { "nn_bridge" }; // most float->int8
 perf_ch_t perf_run     = { "nn_run" };    // ds_cnn_run (matematyka sieci)
 perf_ch_t perf_nnloop  = { "nn_loop" };   // cala iteracja watku NN
 
+/* USER CODE END Variables */
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .priority = (osPriority_t) osPriorityIdle,
+  .stack_size = 128 * 4
+};
+
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
@@ -141,9 +143,6 @@ void StartDspTask(void *argument);
 
 void StartNNTask(void *argument);
 
-void mfcc_compute(const int16_t *frame, float32_t *out);
-
-void mfcc_selftest(void);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -175,6 +174,9 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+
+  kwsEventQueueHandle = osMessageQueueNew(8, sizeof(kws_event_t), NULL);
+
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -187,6 +189,8 @@ void MX_FREERTOS_Init(void) {
   dspTaskHandle = osThreadNew(StartDspTask, NULL, &dspTask_attributes);
 
   nnTaskHandle = osThreadNew(StartNNTask, NULL, &nnTask_attributes);
+
+  urosTaskHandle = osThreadNew(StartUrosTask, (void *)&hlpuart1, &urosTask_attributes);
 
   /* USER CODE END RTOS_THREADS */
 
@@ -221,22 +225,12 @@ void StartDspTask(void *argument)
 { 
   Audio_DSP_Init();  // Initialize the audio DSP processing
 
-  arm_mfcc_init_1024_f32(&mfcc_inst, MFCC_N_MEL, MFCC_N_DCT,
-                          mfcc_dct_coefs, mfcc_filter_pos, mfcc_filter_len,
-                          mfcc_filter_coefs, mfcc_window_coefs);
+  // mfcc_selftest();
 
-  mfcc_selftest();
-
-  // static q7_t nn_in[IN_DIM];
-  // static q7_t nn_out[OUT_DIM];
-  // ds_cnn_run(nn_in, nn_out);   // TYMCZASOWY: test linkowania sieci (wagi ARM, wejscie smieciowe)
-
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; // wlacz jednostke trace
-  DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk; // wlacz licznik cykli
+  perf_init();
 
   HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)pdm_rx_buffer, PDM_BUFFER_SIZE);
-  recording_active = 1;   // start napelniania ringu -> dioda miga
+  recording_active = 1;
 
   int nn_frame_counter = 0;
 
@@ -275,9 +269,9 @@ void StartDspTask(void *argument)
         else if (++nn_frame_counter >= 10) 
         {
           nn_frame_counter = 0;
-          recording_active = 0;   // NN obudzony -> dioda gasnie
+          recording_active = 0;   // NN wake up -> led is off
           osThreadFlagsSet(nnTaskHandle, FLAG_RUN_NN);
-          // asm volatile ("bkpt #0");   // odkomentuj do debugowania (halt psuje pomiary)
+          // asm volatile ("bkpt #0");   // DEBUG
         }
 
         memmove(window, &window[WINDOW_STRIDE], (WINDOW_SIZE - WINDOW_STRIDE) * sizeof(int16_t));
@@ -298,6 +292,10 @@ void StartNNTask(void *argument)
   static float32_t snap[MFCC_N_FRAMES][MFCC_N_DCT];
   static q7_t nn_in[IN_DIM];
   static q7_t nn_out[OUT_DIM]; 
+
+  static uint32_t kws_last_seen[OUT_DIM];
+  for (int i = 0; i < OUT_DIM; i++)
+    kws_last_seen[i] = osKernelGetTickCount() - KWS_REFRACTORY_MS;
 
   for(;;) 
   {
@@ -324,71 +322,37 @@ void StartNNTask(void *argument)
     ds_cnn_run(nn_in, nn_out);
     PERF_END(perf_run);
 
-    // (4) softmax -> procenty
-    int best = 0; float sum = 0.0f, logit[OUT_DIM], prob[OUT_DIM];
-    for (int i = 0; i < OUT_DIM; i++) { logit[i] = nn_out[i] / 2.0f; if (nn_out[i] > nn_out[best]) best = i; }
-    float mx = logit[best];
-    for (int i = 0; i < OUT_DIM; i++) { prob[i] = expf(logit[i] - mx); sum += prob[i]; }
+    // softmax: nn_out is int8 with 1 fractional bit, so logit = nn_out / 2
+    int best = 0;
+    for (int i = 1; i < OUT_DIM; i++)
+      if (nn_out[i] > nn_out[best]) best = i;
+
+    float prob[OUT_DIM], sum = 0.0f;
+    for (int i = 0; i < OUT_DIM; i++) {
+      prob[i] = expf((nn_out[i] - nn_out[best]) / 2.0f);   // minus max: exp() never overflows
+      sum += prob[i];
+    }
     for (int i = 0; i < OUT_DIM; i++) {
       prob[i] /= sum;
-      nn_prob_dbg[i] = prob[i];      // kopiujemy do volatile -> widoczne w debuggerze
-      nn_out_dbg[i]  = nn_out[i];
+      nn_prob_dbg[i] = prob[i];
     }
     nn_best_dbg = best;
-    nn_best_prob_dbg = prob[best];
 
-    // indeks -> nazwa klasy (podglad w debuggerze: p nn_word_dbg)
-    const char *word;
-    switch (nn_best_dbg) {
-      case 0:  word = "_silence_"; break;
-      case 1:  word = "_unknown_"; break;
-      case 2:  word = "go";        break;
-      case 3:  word = "backward";  break;
-      case 4:  word = "left";      break;
-      case 5:  word = "right";     break;
-      case 6:  word = "stop";      break;
-      default: word = "???";       break;
+    if (best >= KWS_GO && prob[best] > KWS_CONF_THRESHOLD) {
+      uint32_t now = osKernelGetTickCount();
+      uint32_t since_last = now - kws_last_seen[best];
+      kws_last_seen[best] = now;
+
+      if (since_last >= KWS_REFRACTORY_MS) {
+        kws_event_t ev = { .cmd = (kws_cmd_t)best, .prob = prob[best], .t0 = DWT->CYCCNT };
+        osMessageQueuePut(kwsEventQueueHandle, &ev, 0U, 0U);
+      }
     }
-    int ci = 0;
-    for (; word[ci] && ci < (int)sizeof(nn_word_dbg) - 1; ci++) nn_word_dbg[ci] = word[ci];
-    nn_word_dbg[ci] = '\0';
 
     PERF_END(perf_nnloop);
-    // asm volatile ("bkpt #1");   // odkomentuj do podgladu wyniku (halt psuje pomiary)
+    // asm volatile ("bkpt #1");   // DEBUG
+
   }
-}
-
-void mfcc_compute(const int16_t *frame, float32_t *out)
-{
-  for (int i = 0; i < MFCC_FRAME_LEN; i++) 
-    mfcc_in[i] = (float32_t)frame[i] / 32768.0f;
-  for (int i = MFCC_FRAME_LEN; i < MFCC_FFT_LEN; i++)
-    mfcc_in[i] = 0.0f;
-
-
-    float32_t maxv;
-    uint32_t maxidx;
-    arm_absmax_f32(mfcc_in, MFCC_FFT_LEN, &maxv, &maxidx);
-
-    arm_mfcc_f32(&mfcc_inst, mfcc_in, out, mfcc_tmp);
-
-    if (maxv != 0.0f) 
-      out[0] -= MFCC_DCT0_SUM * logf(maxv);
-}
-
-void mfcc_selftest(void)
-{
-  float32_t test_out[MFCC_N_DCT];
-
-  mfcc_compute(mfcc_selftest_input, test_out);
-
-  float maxerr = 0.0f;
-  for (int i = 0; i < MFCC_N_DCT; i++) {
-    float e = fabsf(test_out[i] - mfcc_selftest_expected[i]);
-      if (e > maxerr) maxerr = e;
-  }
-    // breakpoint: test_out vs mfcc_selftest_expected, maxerr
-  (void)maxerr;
 }
 
 /* USER CODE END Application */

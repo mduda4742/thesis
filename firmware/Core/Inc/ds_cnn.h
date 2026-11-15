@@ -19,7 +19,7 @@
 #ifndef __DS_CNN_H__
 #define __DS_CNN_H__
 
-#include "arm_math.h"   // q7_t itd. (wagi + local_NN przeniesione do ds_cnn.c)
+#include "arm_math.h"   // q7_t, q15_t (weights and local_NN moved to ds_cnn.c)
 
 #define SAMP_FREQ 16000
 #define MFCC_DEC_BITS 1
@@ -32,10 +32,7 @@
 #define FRAME_LEN ((int16_t)(SAMP_FREQ * 0.001 * FRAME_LEN_MS))
 
 #define IN_DIM (NUM_FRAMES*NUM_MFCC_COEFFS)
-#define OUT_DIM 7   // nasze klasy: _silence_,_unknown_,go,backward,left,right,stop
-
-// UWAGA: przesuniecia bitowe (*_BIAS_LSHIFT / *_OUT_RSHIFT / AVEPOOL_OUT_LSHIFT) NIE sa juz
-// tutaj - sa wygenerowane dla NASZEJ kwantyzacji w ds_cnn_weights.h (export_ds_cnn_weights.py).
+#define OUT_DIM 7   // _silence_, _unknown_, go, backward, left, right, stop
 
 #define CONV1_OUT_CH 64
 #define CONV1_IN_X NUM_MFCC_COEFFS
@@ -100,8 +97,8 @@
 #define SCRATCH_BUFFER_SIZE (2*2*CONV1_OUT_CH*CONV2_DS_KX*CONV2_DS_KY + 2*CONV2_OUT_CH*CONV2_OUT_X*CONV2_OUT_Y)
 // max of im2col: (2*2*64*3*3)=2304 + max consecutive layer activations: (64x25x5 + 64x25x5)=16000
 
-// Bylo: class DS_CNN : public NN { ... run_nn(...) ... wagi jako skladowe }.
-// Teraz czysty C: jedna funkcja, wagi/bufory sa pliko-statyczne w ds_cnn.c.
+// Was: class DS_CNN : public NN { run_nn(...), weights as members }.
+// Now plain C: one function; weights and buffers are file-static in ds_cnn.c.
 #ifdef __cplusplus
 extern "C" {
 #endif

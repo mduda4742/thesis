@@ -2,17 +2,17 @@
  * Copyright (C) 2018 Arm Limited or its affiliates. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Przerobione z ds_cnn.cpp (klasa C++ DS_CNN : public NN) na czysty C:
- *  - wagi: byly skladowymi klasy (DS_CNN::conv1_wt ...) -> teraz pliko-statyczne,
- *  - bufor roboczy: byl 'new q7_t[...]' w konstruktorze -> teraz statyczna tablica,
- *  - run_nn() -> funkcja ds_cnn_run(); CIALO (wywolania arm_*) bez zmian,
- *  - klasa bazowa NN (MFCC/framing) usunieta - nie uzywamy jej.
+ * Ported from ds_cnn.cpp (C++ class DS_CNN : public NN) to plain C:
+ *  - weights: class members (DS_CNN::conv1_wt ...) -> file-static const arrays,
+ *  - scratch buffer: 'new q7_t[...]' in the constructor -> static array,
+ *  - run_nn() -> ds_cnn_run(); the arm_* call sequence is unchanged,
+ *  - base class NN (MFCC/framing) removed - not used.
  */
-#include "cmsis_nn_compat.h"   // __SXTB16_RORn: read_and_pad w naglowkach NN
-#include "ds_cnn.h"            // arm_math.h (q7_t) - tu dsp/utils.h definiuje MAX/MIN
-#include "ds_cnn_weights.h"    // wartosci wag (CONV1_WT ...)
-// CMSIS-DSP (dsp/utils.h) i CMSIS-NN definiuja MAX/MIN identycznie. Undef przed naglowkami
-// NN kasuje nieszkodliwe ostrzezenie "redefined" (NN zdefiniuje je ponizej od zera).
+#include "cmsis_nn_compat.h"   // __SXTB16_RORn, used by read_and_pad in the NN headers
+#include "ds_cnn.h"            // pulls in arm_math.h (q7_t); its dsp/utils.h defines MAX/MIN
+#include "ds_cnn_weights.h"    // weight values (CONV1_WT ...) and bit shifts
+// CMSIS-DSP (dsp/utils.h) and CMSIS-NN define MAX/MIN identically. Undefining them before the
+// NN headers avoids a harmless "redefined" warning; the NN headers define them again.
 #undef MAX
 #undef MIN
 #include "arm_nnfunctions.h"   // arm_convolve_*, arm_relu_q7, arm_fully_connected_q7
@@ -34,7 +34,7 @@ void arm_avepool_q7_HWC_nonsquare (
         q7_t * Im_out,
         const uint16_t out_lshift);
 
-/* --- wagi/biasy: bitowo te same co w klasie, tylko jako pliko-statyczne const --- */
+/* --- weights/biases: bit-identical to the class members, now file-static const --- */
 static const q7_t conv1_wt[CONV1_OUT_CH*CONV1_KX*CONV1_KY]        = CONV1_WT;
 static const q7_t conv1_bias[CONV1_OUT_CH]                       = CONV1_BIAS;
 static const q7_t conv2_ds_wt[CONV1_OUT_CH*CONV2_DS_KX*CONV2_DS_KY] = CONV2_DS_WT;
@@ -56,8 +56,8 @@ static const q7_t conv5_pw_bias[CONV5_OUT_CH]                    = CONV5_PW_BIAS
 static const q7_t final_fc_wt[CONV5_OUT_CH*OUT_DIM]              = FINAL_FC_WT;
 static const q7_t final_fc_bias[OUT_DIM]                         = FINAL_FC_BIAS;
 
-/* --- bufor roboczy: bylo new q7_t[SCRATCH_BUFFER_SIZE] + wskazniki w konstruktorze.
- *     Teraz statycznie; wskazniki to stale offsety w scratch_pad (jak w oryginale). --- */
+/* --- scratch buffer: was new q7_t[SCRATCH_BUFFER_SIZE] in the constructor, now static.
+ *     The buffer pointers are fixed offsets into scratch_pad, as in the original. --- */
 static q7_t scratch_pad[SCRATCH_BUFFER_SIZE];
 static q7_t *const buffer1    = scratch_pad;
 static q7_t *const buffer2    = scratch_pad + (CONV1_OUT_CH*CONV1_OUT_X*CONV1_OUT_Y);

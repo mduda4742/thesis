@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "dma.h"
 #include "hrtim.h"
+#include "usart.h"
 #include "tim.h"
 #include "gpio.h"
 
@@ -51,8 +52,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
-COM_InitTypeDef BspCOMInit;
 
 /* USER CODE BEGIN PV */
 
@@ -105,14 +104,13 @@ int main(void)
   MX_DMA_Init();
   MX_HRTIM1_Init();
   MX_TIM6_Init();
+  MX_LPUART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1);  // Enable the generation of the waveform signal on the designated output
   HAL_HRTIM_WaveformCounterStart(&hhrtim1, HRTIM_TIMERID_TIMER_A);  // Start the counter of the Timer A operating in waveform mode
 
   MY_SAI1_Init();  // Initialize the SAI1 peripheral with custom settings
-
-  Audio_DSP_Init();  // Initialize the audio DSP processing
 
   HAL_TIM_Base_Start_IT(&htim6);
 
@@ -127,17 +125,6 @@ int main(void)
 
   /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
-
-  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
-  BspCOMInit.BaudRate   = 115200;
-  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
-  BspCOMInit.StopBits   = COM_STOPBITS_1;
-  BspCOMInit.Parity     = COM_PARITY_NONE;
-  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
-  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
-  {
-    Error_Handler();
-  }
 
   /* Start scheduler */
   osKernelStart();
@@ -208,7 +195,6 @@ void SystemClock_Config(void)
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) 
 {
   osThreadFlagsSet(dspTaskHandle, FLAG_HALF_CPLT);
-  // HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
 }
 
 void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) 
@@ -232,7 +218,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   if (htim->Instance == TIM6)
   {
-    // LED2 miga podczas napelniania ringu, gasnie gdy NN zostaje obudzony
     if (recording_active)
       HAL_GPIO_TogglePin(LED2_GPIO_PORT, LED2_PIN);
     else

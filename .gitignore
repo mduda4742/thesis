@@ -12,3 +12,7 @@ firmware/build/
 # Pliki binarne i pliki wynikowe
 *.raw
 firmware/*.raw
+
+# micro-ROS source files
+firmware/micro_ros_stm32cubemx_utils
+software/weights.h
